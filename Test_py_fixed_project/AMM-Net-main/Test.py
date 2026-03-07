@@ -1053,15 +1053,11 @@ class catNet(nn.Module):
 
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, image, text,image_att):
+    def forward(self, image, text, image_att):
         txt_result, word_feature = self.txt_enc(text)
-        img_attr = self.img_attr(image_att)
         img_feature = self.img_enc(image)
         img_feature = self.fc4(img_feature)
-
-        img_attr = img_attr.view(img_attr.size(0), img_attr.size(1), -1)
-        img_attr = self.fc3(img_attr)
-        img_attr = img_attr.transpose(2, 1)
+        img_attr = self.attr_enc(image_att)  # (B, 11, 2048)
 
         out = self.fusion(img_feature, img_attr, word_feature)
 

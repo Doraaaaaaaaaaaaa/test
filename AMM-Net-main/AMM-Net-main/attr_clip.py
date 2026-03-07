@@ -31,11 +31,13 @@ class RobustClipAttributeEncoder(nn.Module):
         clip_name="ViT-B/16",
         freeze_clip=True,
         temperature=0.07,
-        device="cuda",
+        device=None,
         download_root=None,
     ):
         super().__init__()
         self.temperature = temperature
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
         # IMPORTANT: load CLIP directly onto the target device (GPU)
