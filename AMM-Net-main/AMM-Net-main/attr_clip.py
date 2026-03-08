@@ -36,6 +36,7 @@ class RobustClipAttributeEncoder(nn.Module):
     ):
         super().__init__()
         self.temperature = temperature
+        self.freeze_clip = freeze_clip
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -66,9 +67,13 @@ class RobustClipAttributeEncoder(nn.Module):
         """
         img_clip = img_clip.to(self.prompt_emb.device)
 
-        with torch.no_grad():
-            v = self.clip_model.encode_image(img_clip)              # (B,d_clip) in most CLIP impls
-            v = F.normalize(v, dim=-1)
+        if self.freeze_clip:
+            with torch.no_grad():
+                v = self.clip_model.encode_image(img_clip)
+        else:
+            v = self.clip_model.encode_image(img_clip)
+
+        v = F.normalize(v, dim=-1)
 
         # If your CLIP impl returns different dims, uncomment this assert to debug:
         # assert v.shape[-1] == self.prompt_emb.shape[-1], (v.shape, self.prompt_emb.shape)

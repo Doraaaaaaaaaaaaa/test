@@ -1,270 +1,25 @@
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HTTP_PROXY"] = ""
-os.environ["HTTPS_PROXY"] = ""
-os.environ["http_proxy"] = ""
-os.environ["https_proxy"] = ""
-
-import time
-import random
 import math
-import copy
-import pickle
-import numpy as np
-from math import sqrt
-from functools import partial
 from typing import Optional
 
-from tqdm import tqdm
+import numpy as np
 from PIL import Image, ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import torch.backends.cudnn as cudnn
-from torch.autograd import Variable
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.utils.data import Dataset as Dataset
-from torch.utils.data import DataLoader as DataLoader
-from torch.utils.data import TensorDataset
 
 from torchvision import transforms
-from torchvision import transforms as tfs
-import torchvision.transforms.functional as tf
-import torchvision.models as models
-import torch.utils.model_zoo as model_zoo
-
 from transformers import BertTokenizer, BertModel
-from scipy import io as sio
-from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import f1_score
 
-import cv2
-import clip
+# 统一使用外部 attr_clip.py 中已经修好的实现
+from attr_clip import RobustClipAttributeEncoder, AADB_PROMPTS_11
 
-
-# =========================================================
-# Prompt Bank
-# =========================================================
-AADB_PROMPTS = [
-    "a photo with interesting content",
-    "a photo with clear object emphasis",
-    "a photo with good lighting",
-    "a photo with good color harmony",
-    "a photo with vivid color",
-    "a photo with shallow depth of field",
-    "a photo with motion blur",
-    "a photo following rule of thirds",
-    "a photo with balanced elements",
-    "a photo with repetition patterns",
-    "a photo with symmetry"
-]
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 # =========================================================
-# ResNet blocks (保留原实现)
-# =========================================================
-def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
-    return nn.Conv2d(
-        in_planes, out_planes,
-        kernel_size=3, stride=stride,
-        padding=dilation, groups=groups,
-        bias=False, dilation=dilation
-    )
-
-
-def conv1x1(in_planes, out_planes, stride=1):
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
-class BasicBlock(nn.Module):
-    expansion = 1
-    __constants__ = ['downsample']
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(BasicBlock, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        if groups != 1 or base_width != 64:
-            raise ValueError("BasicBlock only supports groups=1 and base_width=64")
-        if dilation > 1:
-            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
-
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-        return out
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-    __constants__ = ['downsample']
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None):
-        super(Bottleneck, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-
-        width = int(planes * (base_width / 64.0)) * groups
-        self.conv1 = conv1x1(inplanes, width)
-        self.bn1 = norm_layer(width)
-        self.conv2 = conv3x3(width, width, stride, groups, dilation)
-        self.bn2 = norm_layer(width)
-        self.conv3 = conv1x1(width, planes * self.expansion)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        identity = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
-        out += identity
-        out = self.relu(out)
-        return out
-
-
-class ResNet2(nn.Module):
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None,
-                 norm_layer=None):
-        super(ResNet2, self).__init__()
-        if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
-        self._norm_layer = norm_layer
-
-        self.inplanes = 64
-        self.dilation = 1
-
-        if replace_stride_with_dilation is None:
-            replace_stride_with_dilation = [False, False, False]
-        if len(replace_stride_with_dilation) != 3:
-            raise ValueError("replace_stride_with_dilation should be None or 3-element tuple")
-
-        self.groups = groups
-        self.base_width = width_per_group
-
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = norm_layer(self.inplanes)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-                                       dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-                                       dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       dilate=replace_stride_with_dilation[2])
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-        if zero_init_residual:
-            for m in self.modules():
-                if isinstance(m, Bottleneck):
-                    nn.init.constant_(m.bn3.weight, 0)
-                elif isinstance(m, BasicBlock):
-                    nn.init.constant_(m.bn2.weight, 0)
-
-    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
-        norm_layer = self._norm_layer
-        downsample = None
-        previous_dilation = self.dilation
-
-        if dilate:
-            self.dilation *= stride
-            stride = 1
-
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),
-            )
-
-        layers = []
-        layers.append(
-            block(self.inplanes, planes, stride, downsample, self.groups,
-                  self.base_width, previous_dilation, norm_layer)
-        )
-        self.inplanes = planes * block.expansion
-
-        for _ in range(1, blocks):
-            layers.append(
-                block(self.inplanes, planes, groups=self.groups,
-                      base_width=self.base_width, dilation=self.dilation,
-                      norm_layer=norm_layer)
-            )
-        return nn.Sequential(*layers)
-
-    def _forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        return x
-
-    forward = _forward
-
-
-def _resnet2(arch, block, layers, pretrained, progress, **kwargs):
-    model2 = ResNet2(block, layers, **kwargs)
-    return model2
-
-
-def resnet50_2(pretrained=False, progress=True, **kwargs):
-    return _resnet2('resnet50', Bottleneck, [3, 4, 6, 3], pretrained, progress, **kwargs)
-
-
-# =========================================================
-# Swin Transformer (保留原实现)
+# Swin Transformer
 # =========================================================
 def drop_path_f(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
@@ -279,7 +34,7 @@ def drop_path_f(x, drop_prob: float = 0., training: bool = False):
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
+        super().__init__()
         self.drop_prob = drop_prob
 
     def forward(self, x):
@@ -718,7 +473,7 @@ class EncoderText(nn.Module):
 class Attention_M(nn.Module):
     def __init__(self, embed_dim, hidden_dim=None, out_dim=None, n_head=1,
                  score_function='scaled_dot_product', dropout=0):
-        super(Attention_M, self).__init__()
+        super().__init__()
 
         if hidden_dim is None:
             hidden_dim = embed_dim // n_head
@@ -793,7 +548,7 @@ class Attention_M(nn.Module):
 
 class MIMN(nn.Module):
     def __init__(self):
-        super(MIMN, self).__init__()
+        super().__init__()
         self.hops = 3
 
         self.attention_text = Attention_M(2048, score_function='mlp')
@@ -826,66 +581,20 @@ class MIMN(nn.Module):
 
 
 # =========================================================
-# CLIP Attribute Encoder
-# =========================================================
-class RobustClipAttributeEncoder(nn.Module):
-    def __init__(self, prompts, out_dim=2048, clip_name="ViT-B/16",
-                 freeze_clip=True, temperature=0.07, device=None):
-        super().__init__()
-        self.temperature = temperature
-
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
-
-        self.clip_model, _ = clip.load(clip_name, device=self.device)
-        self.clip_model.eval()
-        if freeze_clip:
-            for p in self.clip_model.parameters():
-                p.requires_grad = False
-
-        with torch.no_grad():
-            tokens = clip.tokenize(prompts).to(self.device)
-            t = self.clip_model.encode_text(tokens)
-            t = F.normalize(t, dim=-1)
-        self.register_buffer("prompt_emb", t)
-
-        d_clip = t.shape[-1]
-        self.proj_T = nn.Linear(d_clip, out_dim)
-        self.proj_V = nn.Linear(d_clip, out_dim)
-        self.layer_norm = nn.LayerNorm(out_dim)
-
-    def forward(self, img_clip):
-        img_clip = img_clip.to(self.prompt_emb.device)
-
-        with torch.no_grad():
-            v = self.clip_model.encode_image(img_clip)
-            v = F.normalize(v, dim=-1)
-
-            logits = (v @ self.prompt_emb.t()) / self.temperature
-            W = torch.softmax(logits, dim=-1)
-
-        T_proj = self.proj_T(self.prompt_emb)
-        T_proj = T_proj.unsqueeze(0).expand(v.size(0), -1, -1)
-
-        V_proj = self.proj_V(v)
-        V_gated = V_proj.unsqueeze(1) * W.unsqueeze(-1)
-
-        F_a = self.layer_norm(T_proj + V_gated)
-        return F_a
-
-
-# =========================================================
 # catNet
 # =========================================================
 class catNet(nn.Module):
-    def __init__(self, bert):
-        super(catNet, self).__init__()
+    def __init__(self, bert, freeze_clip=True):
+        super().__init__()
         self.fusion = MIMN()
         self.txt_enc = EncoderText(bert)
 
-        # 新版属性分支：CLIP prompt-bank
-        self.attr_enc = RobustClipAttributeEncoder(AADB_PROMPTS, out_dim=2048)
+        # 使用外部已修复版本，避免和 Test.py 内部重复实现冲突
+        self.attr_enc = RobustClipAttributeEncoder(
+            prompts=AADB_PROMPTS_11,
+            out_dim=2048,
+            freeze_clip=freeze_clip
+        )
 
         self.img_enc = swin_base_patch4_window7_224_in22k(num_classes=10)
 
@@ -898,13 +607,13 @@ class catNet(nn.Module):
     def forward(self, image, text, image_att):
         txt_result, word_feature = self.txt_enc(text)
 
-        img_feature = self.img_enc(image)
-        img_feature = self.fc4(img_feature)
+        img_feature = self.img_enc(image)     # (B, L, 1024)
+        img_feature = self.fc4(img_feature)   # (B, L, 2048)
 
-        img_attr = self.attr_enc(image_att)   # (B,11,2048)
+        img_attr = self.attr_enc(image_att)   # (B, 11, 2048)
 
         out = self.fusion(img_feature, img_attr, word_feature)
-        h = torch.cat((out, txt_result), 1)
+        h = torch.cat((out, txt_result), dim=1)
 
         h = self.drop(h)
         h = F.relu(self.fc1(h))
@@ -919,10 +628,10 @@ class catNet(nn.Module):
 def binary_accuracy(y_pred, input_label, bins=10):
     rate_scale = torch.tensor([float(i + 1) for i in range(bins)], device=y_pred.device)
     threshold = float(bins / 2)
-    _pred = torch.sum(y_pred * rate_scale, dim=-1)
-    _label = torch.sum(input_label * rate_scale, dim=-1)
-    diff = (((_pred - threshold) * (_label - threshold)) >= 0)
-    acc = torch.sum(diff.float()) / _pred.numel()
+    pred_score = torch.sum(y_pred * rate_scale, dim=-1)
+    true_score = torch.sum(input_label * rate_scale, dim=-1)
+    diff = (((pred_score - threshold) * (true_score - threshold)) >= 0)
+    acc = torch.sum(diff.float()) / pred_score.numel()
     return acc
 
 
@@ -947,9 +656,9 @@ def cal_metrics(output, target, bins=10):
     return [score_pred, score_label, acc_cls, output, target]
 
 
-class emd_loss(torch.nn.Module):
+class emd_loss(nn.Module):
     def __init__(self, dist_r=2, use_l1loss=False, l1loss_coef=0.0):
-        super(emd_loss, self).__init__()
+        super().__init__()
         self.dist_r = dist_r
         self.use_l1loss = use_l1loss
         self.l1loss_coef = l1loss_coef
@@ -991,7 +700,7 @@ class emd_loss(torch.nn.Module):
         return loss
 
 
-class AverageMeter(object):
+class AverageMeter:
     def __init__(self, name, fmt=':f'):
         self.name = name
         self.fmt = fmt
@@ -1015,10 +724,12 @@ class AverageMeter(object):
 
 
 # =========================================================
-# Global tokenizer / transforms
+# Demo tokenizer / transforms
+# 仅供 demo 推理使用；训练请走 dataset_ava.py
 # =========================================================
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 MAX_LEN = 200
+
 
 def txt_process(txt):
     def pad(x):
@@ -1049,6 +760,7 @@ clip_normalize = transforms.Normalize(
     mean=[0.48145466, 0.4578275, 0.40821073],
     std=[0.26862954, 0.26130258, 0.27577711]
 )
+
 transform_att = transforms.Compose([
     transforms.Resize(size=(224, 224)),
     transforms.CenterCrop(224),
@@ -1065,7 +777,7 @@ def load_demo_sample():
     imdir2 = './TestSet/Test_text.txt'
     label_dir = './TestSet/Test_label.txt'
 
-    img = Image.open(imdir1)
+    img = Image.open(imdir1).convert("RGB")
     img_tensor = transform_test(img).unsqueeze(0)
     img_att = transform_att(img).unsqueeze(0)
 
@@ -1076,7 +788,7 @@ def load_demo_sample():
     with open(label_dir, 'r') as f:
         listt = f.read().strip('\n').split(' ')
     label = [float(x) for x in listt[:10]]
-    label = torch.tensor(label).unsqueeze(0)
+    label = torch.tensor(label, dtype=torch.float32).unsqueeze(0)
 
     return img_tensor, txt, img_att, label
 
@@ -1114,19 +826,20 @@ def main():
     print("Using device:", device)
 
     bert = BertModel.from_pretrained('bert-base-uncased')
-    mymodel = catNet(bert)
+    mymodel = catNet(bert).to(device)
 
     model_path = "AMM-Net.pt"
     try:
-        mymodel_dict = torch.load(model_path, map_location='cpu')
-        incompat = mymodel.load_state_dict(mymodel_dict, strict=False)
-        print("成功加载旧权重。")
+        ckpt = torch.load(model_path, map_location='cpu')
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            incompat = mymodel.load_state_dict(ckpt["model"], strict=False)
+        else:
+            incompat = mymodel.load_state_dict(ckpt, strict=False)
+        print("成功加载权重。")
         print("Missing keys:", incompat.missing_keys)
         print("Unexpected keys:", incompat.unexpected_keys)
     except FileNotFoundError:
         print("未找到 AMM-Net.pt 权重文件，将使用随机初始化测试。")
-
-    mymodel = mymodel.to(device)
 
     if not (
         os.path.exists('./TestSet/Test_img.jpg') and
@@ -1137,7 +850,7 @@ def main():
         return
 
     img_tensor, txt, img_att, label = load_demo_sample()
-    score, acc_aes = test(mymodel, img_tensor, txt, img_att, label, device)
+    test(mymodel, img_tensor, txt, img_att, label, device)
 
 
 if __name__ == '__main__':

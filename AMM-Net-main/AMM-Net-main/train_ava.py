@@ -31,20 +31,7 @@ def main():
     bert = BertModel.from_pretrained("bert-base-uncased")
 
     model = amm.catNet(bert).to(device)
-
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        sd = torch.load(args.checkpoint, map_location="cpu")
-        model.load_state_dict(sd, strict=False)
-        print("Loaded checkpoint (strict=False):", args.checkpoint)
-
-    # 训练策略（推荐先稳住）：
-    # 1) 冻结 CLIP（你在 RobustClipAttributeEncoder 里已 freeze_clip=True）
-    # 2) 可选：冻结 BERT / Swin 的大部分参数（先跑通、先收敛）
-    # 你想先“完整训”，就注释掉下面两段；想稳就打开：
-    # for p in model.txt_enc.bert.parameters():
-    #     p.requires_grad = False
-    # for p in model.img_enc.parameters():
-    #     p.requires_grad = False
+    start_epoch = 1
 
     train_ds = AVACaptionsDataset(args.train_csv, args.images_dir, tokenizer)
     val_ds = AVACaptionsDataset(args.val_csv, args.images_dir, tokenizer)
@@ -67,9 +54,28 @@ def main():
     criterion = amm.emd_loss(dist_r=1)
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            model.load_state_dict(ckpt["model"], strict=False)
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+            if "epoch" in ckpt:
+                start_epoch = ckpt["epoch"] + 1
+            print(f"Loaded checkpoint from {args.checkpoint}, resume at epoch {start_epoch}")
+        else:
+            model.load_state_dict(ckpt, strict=False)
+            print(f"Loaded raw state_dict from {args.checkpoint}")
+    if start_epoch > args.epochs:
+        print(f"Checkpoint already at epoch {start_epoch - 1}, nothing to train.")
+        return
     os.makedirs("checkpoints", exist_ok=True)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
@@ -84,7 +90,7 @@ def main():
             loss = criterion(out, y) / args.accum_steps
             loss.backward()
 
-            if step % args.accum_steps == 0:
+            if step % args.accum_steps == 0 or step == len(train_loader):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -92,7 +98,6 @@ def main():
             if step % 50 == 0:
                 print(f"Epoch {epoch} Step {step}: loss={running/50:.4f}")
                 running = 0.0
-
         # val
         model.eval()
         val_loss = 0.0
