@@ -52,7 +52,7 @@ class RobustClipAttributeEncoder(nn.Module):
         with torch.no_grad():
             tokens = clip.tokenize(prompts).to(self.device)         # (m,77)
             t = self.clip_model.encode_text(tokens)                 # (m,d_clip)
-            t = F.normalize(t, dim=-1)
+            t = F.normalize(t.float(), dim=-1)
         self.register_buffer("prompt_emb", t)  # (m, d_clip), follows module.to(...)
 
         d_clip = t.shape[-1]
@@ -75,7 +75,7 @@ class RobustClipAttributeEncoder(nn.Module):
         else:
             v = self.clip_model.encode_image(img_clip)
 
-        v = F.normalize(v, dim=-1)
+        v = F.normalize(v.float(), dim=-1)
 
         logits = (v @ self.prompt_emb.t()) / self.temperature
         w = torch.softmax(logits, dim=-1)
