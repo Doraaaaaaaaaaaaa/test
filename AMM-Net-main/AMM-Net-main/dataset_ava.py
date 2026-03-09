@@ -7,19 +7,22 @@ from torchvision import transforms
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+
 def build_transforms():
-    # Swin / main branch (448 + ImageNet normalize)
-    imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
+    imagenet_norm = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
     transform_main = transforms.Compose([
         transforms.Resize((448, 448)),
         transforms.ToTensor(),
         imagenet_norm,
     ])
 
-    # CLIP attribute branch (224 + CLIP normalize)
-    clip_norm = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                     std=[0.26862954, 0.26130258, 0.27577711])
+    clip_norm = transforms.Normalize(
+        mean=[0.48145466, 0.4578275, 0.40821073],
+        std=[0.26862954, 0.26130258, 0.27577711]
+    )
     transform_clip = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.CenterCrop(224),
@@ -28,11 +31,16 @@ def build_transforms():
     ])
     return transform_main, transform_clip
 
+
 class AVACaptionsDataset(Dataset):
     """
-    CSV columns expected:
-      image_id, comment, score2..score11
+    CSV required columns:
+      image_id, comment, and one of:
+      - prob_1..prob_10
+      - score1..score10
+      - score2..score11
     """
+
     def __init__(self, csv_path: str, images_dir: str, tokenizer, max_len: int = 200):
         self.df = pd.read_csv(csv_path)
         self.images_dir = images_dir
@@ -40,11 +48,31 @@ class AVACaptionsDataset(Dataset):
         self.max_len = max_len
         self.transform_main, self.transform_clip = build_transforms()
 
-        self.score_cols = [f"score{i}" for i in range(2, 12)]
+        self.score_cols = self._resolve_score_cols(self.df.columns)
+
         need = ["image_id", "comment", *self.score_cols]
         for c in need:
             if c not in self.df.columns:
                 raise ValueError(f"Missing column '{c}' in {csv_path}")
+
+    @staticmethod
+    def _resolve_score_cols(columns):
+        columns = set(columns)
+
+        candidates = [
+            [f"prob_{i}" for i in range(1, 11)],
+            [f"score{i}" for i in range(1, 11)],
+            [f"score{i}" for i in range(2, 12)],
+        ]
+
+        for cand in candidates:
+            if all(c in columns for c in cand):
+                return cand
+
+        raise ValueError(
+            "Cannot find valid AVA label columns. "
+            "Expected one of: prob_1..prob_10 / score1..score10 / score2..score11"
+        )
 
     def __len__(self):
         return len(self.df)
@@ -72,11 +100,11 @@ class AVACaptionsDataset(Dataset):
             max_length=self.max_len,
             return_tensors="pt",
         )
-        text_ids = enc["input_ids"].squeeze(0)          # (200,)
-        # 如果你后面愿意改模型支持 mask，可以顺带返回 attention_mask
-        # text_mask = enc["attention_mask"].squeeze(0)
+
+        text_ids = enc["input_ids"].squeeze(0)
+        text_mask = enc["attention_mask"].squeeze(0)
 
         scores = torch.tensor([float(row[c]) for c in self.score_cols], dtype=torch.float32)
-        y = scores / (scores.sum() + 1e-8)              # (10,) distribution
+        y = scores / (scores.sum() + 1e-8)
 
-        return image, text_ids, image_att, y
+        return image, text_ids, text_mask, image_att, y

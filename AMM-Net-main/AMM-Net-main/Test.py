@@ -446,12 +446,14 @@ class EncoderText(nn.Module):
             dropout=0.25
         )
 
-        self.out1 = nn.Linear(2048 * 2, 64)
-        self.out2 = nn.Linear(64, 10)
         self.dropout = nn.Dropout(0.25)
 
-    def forward(self, text):
-        embedded = self.bert(text)[0]
+    def forward(self, text, attention_mask=None):
+        bert_out = self.bert(
+            input_ids=text,
+            attention_mask=attention_mask
+        )
+        embedded = bert_out[0]
 
         outs, hidden = self.rnn(embedded)
         outs = (outs[:, :, :outs.size(2) // 2] + outs[:, :, outs.size(2) // 2:]) / 2
@@ -462,10 +464,7 @@ class EncoderText(nn.Module):
         else:
             hidden = self.dropout(hidden[-1, :, :])
 
-        output = F.relu(self.out1(hidden))
-        output = self.out2(output)
         return o, outs
-
 
 # =========================================================
 # Attention + MIMN
@@ -589,7 +588,6 @@ class catNet(nn.Module):
         self.fusion = MIMN()
         self.txt_enc = EncoderText(bert)
 
-        # 使用外部已修复版本，避免和 Test.py 内部重复实现冲突
         self.attr_enc = RobustClipAttributeEncoder(
             prompts=AADB_PROMPTS_11,
             out_dim=2048,
@@ -604,13 +602,17 @@ class catNet(nn.Module):
         self.fc4 = nn.Linear(1024, 2048)
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, image, text, image_att):
-        txt_result, word_feature = self.txt_enc(text)
+    def forward(self, image, text, text_mask, image_att, return_attr_weights=False):
+        txt_result, word_feature = self.txt_enc(text, text_mask)
 
-        img_feature = self.img_enc(image)     # (B, L, 1024)
-        img_feature = self.fc4(img_feature)   # (B, L, 2048)
+        img_feature = self.img_enc(image)
+        img_feature = self.fc4(img_feature)
 
-        img_attr = self.attr_enc(image_att)   # (B, 11, 2048)
+        if return_attr_weights:
+            img_attr, attr_weights = self.attr_enc(image_att, return_weights=True)
+        else:
+            img_attr = self.attr_enc(image_att, return_weights=False)
+            attr_weights = None
 
         out = self.fusion(img_feature, img_attr, word_feature)
         h = torch.cat((out, txt_result), dim=1)
@@ -619,6 +621,9 @@ class catNet(nn.Module):
         h = F.relu(self.fc1(h))
         h = self.fc2(h)
         h = self.softmax(h)
+
+        if return_attr_weights:
+            return h, attr_weights
         return h
 
 
@@ -802,9 +807,10 @@ def test(mymodel, img_tensor, txt, img_att, label, device):
     txt = txt.to(device)
     img_att = img_att.to(device)
     label = label.to(device)
+    text_mask = torch.ones_like(txt)
 
     with torch.no_grad():
-        output = mymodel(img_tensor, txt, img_att)
+        output = mymodel(img_tensor, txt, text_mask, img_att)
         _ = criterion_aes_val(output, label).item()
         acc_aes = binary_accuracy(output, label, 10)
 

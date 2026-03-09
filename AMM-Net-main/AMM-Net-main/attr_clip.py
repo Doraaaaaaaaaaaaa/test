@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import clip  # 你项目里本地的 clip 模块（从 CG-IAA 复制过来的 ./clip 目录）
+import clip  
 
 AADB_PROMPTS_11 = [
     "a photo with interesting content",
@@ -60,10 +60,12 @@ class RobustClipAttributeEncoder(nn.Module):
         self.proj_V = nn.Linear(d_clip, out_dim)
         self.layer_norm = nn.LayerNorm(out_dim)
 
-    def forward(self, img_clip: torch.Tensor) -> torch.Tensor:
+    def forward(self, img_clip: torch.Tensor, return_weights: bool = False):
         """
         img_clip: (B,3,224,224) CLIP-normalized.
-        returns: Fa (B,m,2048)
+        returns:
+        - Fa: (B,m,2048)
+        - optionally w: (B,m)
         """
         img_clip = img_clip.to(self.prompt_emb.device)
 
@@ -75,19 +77,17 @@ class RobustClipAttributeEncoder(nn.Module):
 
         v = F.normalize(v, dim=-1)
 
-        # If your CLIP impl returns different dims, uncomment this assert to debug:
-        # assert v.shape[-1] == self.prompt_emb.shape[-1], (v.shape, self.prompt_emb.shape)
+        logits = (v @ self.prompt_emb.t()) / self.temperature
+        w = torch.softmax(logits, dim=-1)
 
-        logits = (v @ self.prompt_emb.t()) / self.temperature       # (B,m)
-        w = torch.softmax(logits, dim=-1)                           # (B,m)
+        T_proj = self.proj_T(self.prompt_emb)
+        T_proj = T_proj.unsqueeze(0).expand(v.size(0), -1, -1)
 
-        # Text prior projection
-        T_proj = self.proj_T(self.prompt_emb)                       # (m,out_dim)
-        T_proj = T_proj.unsqueeze(0).expand(v.size(0), -1, -1)      # (B,m,out_dim)
+        V_proj = self.proj_V(v)
+        V_gated = V_proj.unsqueeze(1) * w.unsqueeze(-1)
 
-        # Visual global projection + gating
-        V_proj = self.proj_V(v)                                     # (B,out_dim)
-        V_gated = V_proj.unsqueeze(1) * w.unsqueeze(-1)             # (B,m,out_dim)
+        Fa = self.layer_norm(T_proj + V_gated)
 
-        Fa = self.layer_norm(T_proj + V_gated)                      # (B,m,out_dim)
+        if return_weights:
+            return Fa, w
         return Fa

@@ -108,13 +108,14 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
 
-        for step, (image, text_ids, image_att, y) in enumerate(train_loader, 1):
+        for step, (image, text_ids, text_mask, image_att, y) in enumerate(train_loader, 1):
             image = image.to(device, non_blocking=True)
             text_ids = text_ids.to(device, non_blocking=True)
+            text_mask = text_mask.to(device, non_blocking=True)
             image_att = image_att.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            out = model(image, text_ids, image_att)
+            out = model(image, text_ids, text_mask, image_att)
             loss = criterion(out, y) / args.accum_steps
             loss.backward()
 
@@ -141,13 +142,14 @@ def main():
         gt_dist_all = []
 
         with torch.no_grad():
-            for image, text_ids, image_att, y in val_loader:
+            for image, text_ids, text_mask, image_att, y in val_loader:
                 image = image.to(device, non_blocking=True)
                 text_ids = text_ids.to(device, non_blocking=True)
+                text_mask = text_mask.to(device, non_blocking=True)
                 image_att = image_att.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-                out = model(image, text_ids, image_att)
+                out = model(image, text_ids, text_mask, image_att)
 
                 batch_loss = criterion(out, y).item()
                 val_loss += batch_loss
