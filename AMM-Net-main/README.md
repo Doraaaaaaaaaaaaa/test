@@ -14,3 +14,16 @@ volume={33},
 number={12},  
 pages={7413-7424},  
 doi={10.1109/TCSVT.2023.3272984}}  
+
+# AMM-Net + CLIP Attribute for AVA Aesthetic Assessment
+
+本项目基于 AMM-Net 做了适配与重构，用于 **AVA 图像美学评估**。  
+当前版本支持：
+
+- 图像主干分支：Swin Transformer
+- 文本分支：BERT + GRU
+- 属性分支：CLIP prompt-bank attribute encoder
+- 多模态融合：MIMN
+- 标签形式：AVA 评分分布（10 维）
+- 指标：EMD / Accuracy / PLCC / SRCC
+- 数据输入：`train.csv` / `val.csv` / `test.csv` + AVA 图片目录
