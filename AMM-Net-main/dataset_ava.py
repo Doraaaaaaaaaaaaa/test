@@ -55,6 +55,25 @@ class AVACaptionsDataset(Dataset):
             if c not in self.df.columns:
                 raise ValueError(f"Missing column '{c}' in {csv_path}")
 
+        # ★ 预计算所有 tokenization，避免 __getitem__ 中重复计算
+        print(f"Pre-tokenizing {len(self.df)} comments...")
+        comments = self.df["comment"].astype(str).tolist()
+        enc_all = tokenizer(
+            comments,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
+        self.all_input_ids = enc_all["input_ids"]       # (N, max_len)
+        self.all_attention_mask = enc_all["attention_mask"]  # (N, max_len)
+
+        # ★ 预计算所有 score 分布
+        scores_np = self.df[self.score_cols].values.astype("float32")
+        scores_sum = scores_np.sum(axis=1, keepdims=True) + 1e-8
+        self.all_labels = torch.from_numpy(scores_np / scores_sum)  # (N, 10)
+        print("Pre-tokenization done.")
+
     @staticmethod
     def _resolve_score_cols(columns):
         columns = set(columns)
@@ -92,19 +111,9 @@ class AVACaptionsDataset(Dataset):
         image = self.transform_main(img)
         image_att = self.transform_clip(img)
 
-        comment = str(row["comment"])
-        enc = self.tokenizer(
-            comment,
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_len,
-            return_tensors="pt",
-        )
-
-        text_ids = enc["input_ids"].squeeze(0)
-        text_mask = enc["attention_mask"].squeeze(0)
-
-        scores = torch.tensor([float(row[c]) for c in self.score_cols], dtype=torch.float32)
-        y = scores / (scores.sum() + 1e-8)
+        # ★ 直接索引预计算结果，无需重复 tokenize
+        text_ids = self.all_input_ids[idx]
+        text_mask = self.all_attention_mask[idx]
+        y = self.all_labels[idx]
 
         return image, text_ids, text_mask, image_att, y

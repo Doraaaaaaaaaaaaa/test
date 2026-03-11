@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 from transformers import BertTokenizer, BertModel
 from scipy.stats import pearsonr, spearmanr
 
@@ -44,12 +43,9 @@ def main():
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)  # ★ 改为4，多进程加载
+    parser.add_argument("--num_workers", type=int, default=0)  # Windows 稳
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--freeze_clip", action="store_true")   # 加这个，便于做消融
-    parser.add_argument("--no_amp", action="store_true", help="禁用混合精度")
-    parser.add_argument("--precompute_clip", type=str, default="",
-                        help="预计算CLIP特征的缓存目录，留空则不缓存")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,8 +66,6 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,  # ★ 避免每个epoch重建worker
-        prefetch_factor=2 if args.num_workers > 0 else None,  # ★ 预取
     )
     val_loader = DataLoader(
         val_ds,
@@ -79,16 +73,10 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     criterion = amm.emd_loss(dist_r=1)
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-
-    # ★ 混合精度
-    use_amp = (not args.no_amp) and torch.cuda.is_available()
-    scaler = GradScaler(enabled=use_amp)
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -127,15 +115,12 @@ def main():
             image_att = image_att.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # ★ 混合精度前向 + 反向
-            with autocast(enabled=use_amp):
-                out = model(image, text_ids, text_mask, image_att)
-                loss = criterion(out, y) / args.accum_steps
-            scaler.scale(loss).backward()
+            out = model(image, text_ids, text_mask, image_att)
+            loss = criterion(out, y) / args.accum_steps
+            loss.backward()
 
             if step % args.accum_steps == 0 or step == len(train_loader):
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
             running += loss.item() * args.accum_steps
@@ -164,8 +149,7 @@ def main():
                 image_att = image_att.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-                with autocast(enabled=use_amp):
-                    out = model(image, text_ids, text_mask, image_att)
+                out = model(image, text_ids, text_mask, image_att)
 
                 batch_loss = criterion(out, y).item()
                 val_loss += batch_loss
