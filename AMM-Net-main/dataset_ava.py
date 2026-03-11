@@ -41,7 +41,14 @@ class AVACaptionsDataset(Dataset):
       - score2..score11
     """
 
-    def __init__(self, csv_path: str, images_dir: str, tokenizer, max_len: int = 200):
+    def __init__(
+        self,
+        csv_path: str,
+        images_dir: str,
+        tokenizer,
+        max_len: int = 200,
+        clip_feature_path: str = "",
+    ):
         self.df = pd.read_csv(csv_path)
         self.images_dir = images_dir
         self.tokenizer = tokenizer
@@ -55,8 +62,8 @@ class AVACaptionsDataset(Dataset):
             if c not in self.df.columns:
                 raise ValueError(f"Missing column '{c}' in {csv_path}")
 
-        # ★ 预计算所有 tokenization，避免 __getitem__ 中重复计算
-        print(f"Pre-tokenizing {len(self.df)} comments...")
+        # pre-tokenize all text once
+        print(f"Pre-tokenizing {len(self.df)} comments from {csv_path} ...")
         comments = self.df["comment"].astype(str).tolist()
         enc_all = tokenizer(
             comments,
@@ -65,14 +72,23 @@ class AVACaptionsDataset(Dataset):
             max_length=max_len,
             return_tensors="pt",
         )
-        self.all_input_ids = enc_all["input_ids"]       # (N, max_len)
-        self.all_attention_mask = enc_all["attention_mask"]  # (N, max_len)
+        self.all_input_ids = enc_all["input_ids"]
+        self.all_attention_mask = enc_all["attention_mask"]
 
-        # ★ 预计算所有 score 分布
+        # precompute normalized labels
         scores_np = self.df[self.score_cols].values.astype("float32")
         scores_sum = scores_np.sum(axis=1, keepdims=True) + 1e-8
-        self.all_labels = torch.from_numpy(scores_np / scores_sum)  # (N, 10)
-        print("Pre-tokenization done.")
+        self.all_labels = torch.from_numpy(scores_np / scores_sum)
+
+        # optional precomputed CLIP features
+        self.use_precomputed_clip = False
+        self.clip_features = None
+        if clip_feature_path:
+            self.clip_features = self._load_clip_feature_file(clip_feature_path)
+            self.use_precomputed_clip = True
+            print(f"Loaded {len(self.clip_features)} precomputed CLIP features from {clip_feature_path}")
+
+        print("Dataset init done.")
 
     @staticmethod
     def _resolve_score_cols(columns):
@@ -93,6 +109,38 @@ class AVACaptionsDataset(Dataset):
             "Expected one of: prob_1..prob_10 / score1..score10 / score2..score11"
         )
 
+    @staticmethod
+    def _load_clip_feature_file(path: str):
+        """
+        path can be:
+        - directory containing clip_features.pt
+        - direct path to clip_features.pt
+        """
+        if os.path.isdir(path):
+            path = os.path.join(path, "clip_features.pt")
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Precomputed CLIP feature file not found: {path}")
+
+        obj = torch.load(path, map_location="cpu")
+        if not isinstance(obj, dict):
+            raise ValueError(f"Expected dict in {path}, got {type(obj)}")
+        return obj
+
+    @staticmethod
+    def _candidate_feature_keys(image_id: str):
+        image_id = str(image_id)
+        keys = [image_id]
+
+        base, ext = os.path.splitext(image_id)
+        if ext:
+            keys.append(base)
+        else:
+            keys.append(image_id + ".jpg")
+            keys.append(image_id + ".png")
+
+        return list(dict.fromkeys(keys))
+
     def __len__(self):
         return len(self.df)
 
@@ -109,11 +157,27 @@ class AVACaptionsDataset(Dataset):
 
         img = Image.open(img_path).convert("RGB")
         image = self.transform_main(img)
-        image_att = self.transform_clip(img)
 
-        # ★ 直接索引预计算结果，无需重复 tokenize
+        if self.use_precomputed_clip:
+            feat = None
+            for k in self._candidate_feature_keys(image_id):
+                if k in self.clip_features:
+                    feat = self.clip_features[k]
+                    break
+            if feat is None:
+                raise KeyError(
+                    f"Cannot find precomputed CLIP feature for image_id='{image_id}'. "
+                    f"Tried keys: {self._candidate_feature_keys(image_id)}"
+                )
+
+            if not isinstance(feat, torch.Tensor):
+                feat = torch.tensor(feat)
+            image_att_or_feat = feat.float()
+        else:
+            image_att_or_feat = self.transform_clip(img)
+
         text_ids = self.all_input_ids[idx]
         text_mask = self.all_attention_mask[idx]
         y = self.all_labels[idx]
 
-        return image, text_ids, text_mask, image_att, y
+        return image, text_ids, text_mask, image_att_or_feat, y

@@ -9,10 +9,8 @@ from transformers import BertTokenizer, BertModel
 from scipy.stats import pearsonr, spearmanr
 
 from dataset_ava import AVACaptionsDataset
-
-# 你现有的 Test.py 里必须包含：catNet, emd_loss, binary_accuracy
-# 并且 Test.py 必须是 import-safe（不能在 import 时就去读 TestSet 文件）
-import Test as amm
+from models import catNet
+from losses import emd_loss, binary_accuracy
 
 
 def safe_corr(pred, target):
@@ -44,25 +42,42 @@ def main():
     parser.add_argument("--accum_steps", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)  # ★ 改为4，多进程加载
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--checkpoint", type=str, default="")
-    parser.add_argument("--freeze_clip", action="store_true")   # 加这个，便于做消融
+    parser.add_argument("--freeze_clip", action="store_true")
     parser.add_argument("--no_amp", action="store_true", help="禁用混合精度")
-    parser.add_argument("--precompute_clip", type=str, default="",
-                        help="预计算CLIP特征的缓存目录，留空则不缓存")
+    parser.add_argument(
+        "--precompute_clip",
+        type=str,
+        default="",
+        help="预计算CLIP特征缓存目录，或 clip_features.pt 文件路径；留空则不使用缓存",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
+    if args.precompute_clip and not args.freeze_clip:
+        raise ValueError("--precompute_clip 仅能与 --freeze_clip 一起使用；否则 CLIP 图像分支不会被训练。")
+
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     bert = BertModel.from_pretrained("bert-base-uncased")
 
-    model = amm.catNet(bert, freeze_clip=args.freeze_clip).to(device)
+    model = catNet(bert, freeze_clip=args.freeze_clip).to(device)
     start_epoch = 1
 
-    train_ds = AVACaptionsDataset(args.train_csv, args.images_dir, tokenizer)
-    val_ds = AVACaptionsDataset(args.val_csv, args.images_dir, tokenizer)
+    train_ds = AVACaptionsDataset(
+        args.train_csv,
+        args.images_dir,
+        tokenizer,
+        clip_feature_path=args.precompute_clip,
+    )
+    val_ds = AVACaptionsDataset(
+        args.val_csv,
+        args.images_dir,
+        tokenizer,
+        clip_feature_path=args.precompute_clip,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -70,8 +85,8 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,  # ★ 避免每个epoch重建worker
-        prefetch_factor=2 if args.num_workers > 0 else None,  # ★ 预取
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds,
@@ -83,10 +98,9 @@ def main():
         prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
-    criterion = amm.emd_loss(dist_r=1)
+    criterion = emd_loss(dist_r=1)
     optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
-    # ★ 混合精度
     use_amp = (not args.no_amp) and torch.cuda.is_available()
     scaler = GradScaler(enabled=use_amp)
 
@@ -111,7 +125,8 @@ def main():
         print(f"Checkpoint already at epoch {start_epoch - 1}, nothing to train.")
         return
 
-    os.makedirs("/root/autodl-tmp/checkpoints", exist_ok=True)
+    checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     bins_tensor = torch.arange(1, 11, dtype=torch.float32, device=device)
 
@@ -120,17 +135,17 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
 
-        for step, (image, text_ids, text_mask, image_att, y) in enumerate(train_loader, 1):
+        for step, (image, text_ids, text_mask, image_att_or_feat, y) in enumerate(train_loader, 1):
             image = image.to(device, non_blocking=True)
             text_ids = text_ids.to(device, non_blocking=True)
             text_mask = text_mask.to(device, non_blocking=True)
-            image_att = image_att.to(device, non_blocking=True)
+            image_att_or_feat = image_att_or_feat.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
-            # ★ 混合精度前向 + 反向
             with autocast(enabled=use_amp):
-                out = model(image, text_ids, text_mask, image_att)
+                out = model(image, text_ids, text_mask, image_att_or_feat)
                 loss = criterion(out, y) / args.accum_steps
+
             scaler.scale(loss).backward()
 
             if step % args.accum_steps == 0 or step == len(train_loader):
@@ -140,12 +155,9 @@ def main():
 
             running += loss.item() * args.accum_steps
             if step % 50 == 0:
-                print(f"Epoch {epoch} Step {step}: loss={running/50:.4f}")
+                print(f"Epoch {epoch} Step {step}: loss={running / 50:.4f}")
                 running = 0.0
 
-        # =========================
-        # Validation
-        # =========================
         model.eval()
         val_loss = 0.0
         val_acc_sum = 0.0
@@ -153,24 +165,22 @@ def main():
 
         pred_means_all = []
         gt_means_all = []
-        pred_dist_all = []
-        gt_dist_all = []
 
         with torch.no_grad():
-            for image, text_ids, text_mask, image_att, y in val_loader:
+            for image, text_ids, text_mask, image_att_or_feat, y in val_loader:
                 image = image.to(device, non_blocking=True)
                 text_ids = text_ids.to(device, non_blocking=True)
                 text_mask = text_mask.to(device, non_blocking=True)
-                image_att = image_att.to(device, non_blocking=True)
+                image_att_or_feat = image_att_or_feat.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
                 with autocast(enabled=use_amp):
-                    out = model(image, text_ids, text_mask, image_att)
+                    out = model(image, text_ids, text_mask, image_att_or_feat)
 
                 batch_loss = criterion(out, y).item()
                 val_loss += batch_loss
 
-                batch_acc = amm.binary_accuracy(out, y, bins=10).item()
+                batch_acc = binary_accuracy(out, y, bins=10).item()
                 val_acc_sum += batch_acc
                 val_acc_batches += 1
 
@@ -179,8 +189,6 @@ def main():
 
                 pred_means_all.extend(pred_mean.cpu().numpy().tolist())
                 gt_means_all.extend(gt_mean.cpu().numpy().tolist())
-                pred_dist_all.append(out.cpu().numpy())
-                gt_dist_all.append(y.cpu().numpy())
 
         val_loss /= max(1, len(val_loader))
         val_acc = val_acc_sum / max(1, val_acc_batches)
@@ -194,7 +202,7 @@ def main():
             f"val_srcc={val_srcc:.4f}"
         )
 
-        ckpt_path = f"/root/autodl-tmp/checkpoints/ammnet_clipattr_epoch{epoch}.pt"
+        ckpt_path = os.path.join(checkpoint_dir, f"ammnet_clipattr_epoch{epoch}.pt")
         torch.save(
             {
                 "epoch": epoch,
